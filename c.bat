@@ -1,0 +1,1 @@
+gcc -O3 -o itl.exe itl_interpreter.c pdcurses.a -lm
