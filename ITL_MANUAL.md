@@ -18,13 +18,17 @@
 10. [Arrays](#10-arrays)
 11. [Math functions](#11-math-functions)
 12. [Screen functions](#12-screen-functions)
-13. [Special tokens](#13-special-tokens)
-14. [Statement separator](#14-statement-separator)
-15. [Parenthesis blocks](#15-parenthesis-blocks)
-16. [Type conversion](#16-type-conversion)
-17. [Comments](#17-comments)
-18. [Error handling](#18-error-handling)
-19. [Examples](#19-examples)
+13. [Graphics functions](#13-graphics-functions)
+14. [Mouse functions](#15-mouse-functions)
+15. [Text window mouse functions](#16-text-window-mouse-functions)
+16. [Timing functions](#14-timing-functions)
+17. [Special tokens](#13-special-tokens)
+18. [Statement separator](#14-statement-separator)
+19. [Parenthesis blocks](#15-parenthesis-blocks)
+20. [Type conversion](#16-type-conversion)
+21. [Comments](#17-comments)
+22. [Error handling](#18-error-handling)
+23. [Examples](#19-examples)
 
 ---
 
@@ -471,7 +475,212 @@ clear()
 
 ---
 
-## 13. Special tokens
+## 13. Graphics functions
+
+These functions open and draw into a separate **WinAPI GDI window** (pixel-based). They are independent of the PDCurses terminal. `gopen()` must be called before any other `g*` function.
+
+### Opening the window
+
+#### `gopen(w, h)`
+
+Opens a graphics window of `w × h` pixels. If the window is already open, does nothing.  
+Returns `1`.
+```
+gopen(800, 600)
+```
+
+### Drawing colors
+
+#### `gpen(r, g, b)`
+
+Sets the current **pen color** (used by lines, borders, pixels, and text). Each component is 0–255.
+```
+gpen(255, 0, 0)    (* red *)
+```
+
+#### `gbr(r, g, b)`
+
+Sets the current **brush color** (used for filled shapes and `gclear()`). Each component is 0–255.
+```
+gbr(0, 0, 128)    (* dark blue fill *)
+```
+
+### Clearing and refreshing
+
+#### `gclear()`
+
+Fills the entire graphics window with the current brush color.
+
+#### `grefresh()`
+
+Forces an immediate repaint of the graphics window. Drawing functions call this automatically, but it can be called manually if needed.
+
+### Pixel
+
+#### `gpixel(x, y)`
+
+Draws a single pixel at `(x, y)` with the current pen color.
+
+### Lines and rectangles
+
+#### `gline(x1, y1, x2, y2)`
+
+Draws a line from `(x1, y1)` to `(x2, y2)` with the current pen color.
+
+#### `grect(x1, y1, x2, y2)`
+
+Draws the **border** of a rectangle using the current pen color. The interior is transparent.
+
+#### `gfillrect(x1, y1, x2, y2)`
+
+Draws a **filled** rectangle using the current pen color for the border and the current brush color for the interior.
+
+### Circles (ellipses)
+
+#### `gcircle(x, y, r)`
+
+Draws the **border** of a circle centered at `(x, y)` with radius `r`, using the current pen color. The interior is transparent.
+
+#### `gfillcircle(x, y, r)`
+
+Draws a **filled** circle centered at `(x, y)` with radius `r`, using the current pen color for the border and the current brush color for the interior.
+
+### Text
+
+#### `gtext(x, y, str)`
+
+Draws the string `str` at pixel position `(x, y)` using the current pen color on a transparent background.
+```
+gtext(10, 10, "Hello from ITL!")
+```
+
+### Example
+```
+gopen(640, 480)
+gbr(0, 0, 0)
+gclear()
+gpen(0, 255, 0)
+gcircle(320, 240, 100)
+gpen(255, 255, 0)
+gtext(280, 230, "ITL!")
+```
+---
+
+## 14. Mouse functions
+
+These functions read the state of the mouse inside the GDI graphics window. They only work after `gopen()` has been called. All coordinates are in pixels relative to the top-left corner of the graphics window client area.
+
+#### `gmx()`
+
+Returns the current X coordinate of the mouse cursor.
+
+#### `gmy()`
+
+Returns the current Y coordinate of the mouse cursor.
+
+#### `gmb()`
+
+Returns a bitmask of the mouse buttons currently held down:
+
+| Bit | Value | Button |
+|-----|-------|--------|
+| 0 | 1 | Left button |
+| 1 | 2 | Right button |
+| 2 | 4 | Middle button |
+```
+B = gmb()
+#=(B&1)*10    (* jump to line 10 if left button is held *)
+```
+
+#### `gmclick()`
+
+Returns the button number of the most recent mouse click and **clears** the event so the next call returns 0 until a new click occurs:
+
+| Return value | Meaning |
+|---|---|
+| 0 | No new click since last call |
+| 1 | Left button clicked |
+| 2 | Right button clicked |
+| 3 | Middle button clicked |
+```
+C = gmclick()
+#=(C=0)*W    (* loop back if no click *)
+```
+
+#### `gmdrag(b)`
+
+Returns `1` if button `b` is currently held down **while the mouse is moving** (drag), `0` otherwise. `b` is 1 for left, 2 for right, 3 for middle.
+```
+#=!gmdrag(1)*W    (* loop back if not dragging with left button *)
+gpixel(gmx(), gmy())
+```
+
+---
+
+## 16. Text window mouse functions
+
+These functions read the state of the mouse inside the **PDCurses text window**. Coordinates are in **character cells** (column/row), not pixels. Mouse support is always active — no initialization is required.
+
+> **Note:** These functions rely on the `:` token to pump the PDCurses event queue. At least one `:` must appear in any loop that uses text mouse functions, otherwise events are never received.
+
+#### `tmx()`
+
+Returns the current **column** (0-based) of the mouse cursor inside the text window.
+
+#### `tmy()`
+
+Returns the current **row** (0-based) of the mouse cursor inside the text window.
+
+#### `tmclick()`
+
+Returns the button number of the most recent mouse click and **clears** the event so the next call returns 0 until a new click occurs:
+
+| Return value | Meaning |
+|---|---|
+| 0 | No new click since last call |
+| 1 | Left button clicked |
+| 2 | Right button clicked |
+| 3 | Middle button clicked |
+
+#### `tmdrag(b)`
+
+Returns `1` if button `b` is currently held down while the mouse is moving (drag), `0` otherwise. `b` is 1 for left, 2 for right, 3 for middle.
+
+---
+
+## 16. Timing functions
+
+Timing functions return time values as numbers (seconds or milliseconds). They use the Windows high-resolution performance counter and are therefore not available on non-Windows builds.
+
+#### `time()`
+
+Returns the current Unix timestamp: the number of whole **seconds** elapsed since 1 January 1970 00:00:00 UTC.
+```
+T = time()
+?"Unix time: "+T+"\n"
+```
+
+#### `ticks()`
+
+Returns the number of **milliseconds** elapsed since the interpreter started. Useful for measuring total run time or creating time-based animations.
+```
+?"Uptime ms: "+ticks()+"\n"
+```
+
+#### `elapsed()`
+
+Returns the number of **milliseconds** elapsed since the **last call** to `elapsed()`. On the first call, the reference point is interpreter startup. Resets its internal reference on every call, making it suitable for per-frame timing.
+```
+elapsed()        (* reset reference *)
+W=#
+"... work ..."
+?"Frame time: "+elapsed()+" ms\n"
+#=W
+```
+
+---
+
+## 17. Special tokens
 
 ### `#` – current line number
 
@@ -504,7 +713,7 @@ K = :
 
 ---
 
-## 14. Statement separator
+## 18. Statement separator
 
 The semicolon `;` separates multiple statements on a single line (at the top level, i.e., outside parentheses and strings):
 
@@ -516,7 +725,7 @@ Each segment becomes a separately numbered line internally.
 
 ---
 
-## 15. Parenthesis blocks
+## 19. Parenthesis blocks
 
 A pair of parentheses encloses a **block** of statements separated by `;` or `,`. The block is evaluated as an expression; its value is the value of the last statement inside it.
 
@@ -537,7 +746,7 @@ Y = (A=10; (B=A*2; B+1))    (* Y = 21, A = 10, B = 20 *)
 
 ---
 
-## 16. Type conversion
+## 20. Type conversion
 
 `$VAR` converts a variable from one type to the other:
 
@@ -554,7 +763,7 @@ X = $S          (* X = 3.14 *)
 
 ---
 
-## 17. Comments
+## 21. Comments
 
 ITL has no comment syntax. Common workarounds:
 
@@ -563,7 +772,7 @@ ITL has no comment syntax. Common workarounds:
 
 ---
 
-## 18. Error handling
+## 22. Error handling
 
 Runtime errors (division by zero, unknown function, out-of-range values) are reported as messages on the screen. In **file mode** an unrecoverable error terminates the interpreter. In **REPL mode** errors are reported and execution continues from the next input.
 
@@ -571,7 +780,7 @@ Array indexing out of bounds: reading beyond the array returns 0; writing auto-e
 
 ---
 
-## 19. Examples
+## 23. Examples
 
 ### Hello, World
 
@@ -657,4 +866,104 @@ Ymax(1,min(Y,geth-2))
 gotoxy(X,Y)
 putch(42)
 #:=0*5
+```
+
+### GDI graphics: bouncing ball
+
+```
+gopen(640,480)
+gbr(0,0,0)
+gclear()
+grefresh()
+X=320
+Y=240
+P=3
+Q=2
+R=15
+E=0
+elapsed()
+W=#
+E=E+elapsed()
+#=(E<16)*(W+1)
+E=0
+gpen(0,0,0)
+gbr(0,0,0)
+gfillcircle(X,Y,R)
+X=X+P
+Y=Y+Q
+U=(X<R)|(X>(639-R))
+V=(Y<R)|(Y>(479-R))
+P=P*(1-(2*U))
+Q=Q*(1-(2*V))
+gpen(0,200,255)
+gbr(0,200,255)
+gfillcircle(X,Y,R)
+grefresh()
+K=:
+#=(K=0)*(W+1)
+```
+
+### GDI graphics: bouncing ball (esoteric version)
+
+```
+gopen(640,480)
+gbr(0,0,0)
+gclear;grefresh
+X320;Y240
+P3;Q2
+R15;E0
+elapsed
+W#+1
+E+elapsed()
+#E<16*W
+E0
+gpen(0,0,0);gbr(0,0,0)
+gfillcircle(X,Y,R)
+X+P;Y+Q
+UX<R|(X>(639-R))
+VY<R|(Y>(479-R))
+P*(1-(2*U))
+Q*(1-(2*V))
+gpen(0,200,255);gbr(0,200,255)
+gfillcircle(X,Y,R)
+grefresh
+#:=0*W
+```
+
+**Draw a circle on each click:** (in graphics window)
+```
+gopen(640,480)
+gclear()
+grefresh()
+W=#
+C=gmclick()
+#=(C=0)*(W+1)
+gpen(255,255,0)
+gfillcircle(gmx(),gmy(),10)
+grefresh()
+#=W
+```
+
+**Paint with drag:**  (in graphics window)
+```
+gopen(640,480)
+gclear()
+grefresh()
+gpen(255,0,0)
+W=#
+#=!gmdrag(1)*(W+1)
+gpixel(gmx(),gmy())
+grefresh()
+#=W
+```
+
+**Write an X at each click position:** (in text window)
+```
+W=#
+K:
+C=tmclick()
+#=(C=0)*(W+1)
+gotoxy(tmx(),tmy())
+putch(88)
+#=W
 ```

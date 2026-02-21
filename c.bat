@@ -1,1 +1,1 @@
-gcc -O3 -o itl.exe itl_interpreter.c pdcurses.a -lm
+gcc -O3 -I. -o itl.exe itl_interpreter.c pdcurses.a -lm -lgdi32 -luser32

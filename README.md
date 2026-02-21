@@ -35,6 +35,10 @@ N+1
 - **Dynamic array** `@index` – auto-growing, zero-based
 - **Math library** – sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, exp, log, log2, log10, sqrt, cbrt, ceil, floor, round, trunc, abs, sign, pow, fmod, hypot, max, min, pi, e
 - **Screen functions** (PDCurses) – gotoxy, putch, getch, setfore, setback, setattr, getw, geth, clear
+- **Graphics functions** (WinAPI GDI) – gopen, gclear, gpen, gbr, gpixel, gline, grect, gfillrect, gcircle, gfillcircle, gtext, grefresh
+- **Mouse functions** – gmx, gmy, gmb, gmclick, gmdrag
+- **Text window mouse functions** – tmx, tmy, tmclick, tmdrag
+- **Timing functions** – time, ticks, elapsed
 - **Operators** – `+ - * / % ^ & | < > = !` with string concatenation via `+`
 - **Interactive REPL** with line numbering, `:help`, `:vars`, `:lines`, `:debug`, `:reset`
 - **File execution** – pass a `.it` source file as an argument
@@ -55,10 +59,8 @@ You need three PDCurses files in the same directory as the source (or on the inc
 ### Compile on Windows with GCC (MSYS2 / MinGW-w64)
 
 ```bash
-gcc -O2 -o itl.exe itl_interpreter.c pdcurses.a -lm
+gcc -O3 -I. -o itl.exe itl_interpreter.c pdcurses.a -lmgcc -lgdi32 -luser32
 ```
-
-If the headers and library are not in the default search paths, specify them explicitly.
 
 ### Run
 

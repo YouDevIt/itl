@@ -5,7 +5,7 @@
  * Advanced REPL mode with line numbers and jumps
  *
  * Build (MinGW/MSYS2):
- *   gcc -O2 -o itl itl_interpreter.c pdcurses.a -lm -o itl.exe
+ *   gcc -O3 -I. -o itl.exe itl_interpreter.c pdcurses.a -lm -lgdi32 -luser32
  *
  * Changes from previous version:
  *  - Replaced conio.h I/O with PDCurses (screen, color, cursor control)
@@ -21,11 +21,9 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
-/* Include windows.h before curses.h to avoid redefinition conflicts */
+#include <curses.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-/* PDCurses headers (pdcurses.a, curses.h and panel.h must be available) */
-#include <curses.h>
 
 #define MAX_LINE_LENGTH 4096
 #define MAX_LINES 100000
@@ -80,6 +78,33 @@ char *repl_history[REPL_HISTORY_MAX];
 int   repl_history_count = 0;
 
 volatile int g_interrupted = 0;
+/* GDI graphics state */
+static HWND   g_hwnd      = NULL;
+static HDC    g_hdc_buf   = NULL;
+static HBITMAP g_hbmp     = NULL;
+static int    g_gfx_w     = 640;
+static int    g_gfx_h     = 480;
+static HPEN   g_pen       = NULL;
+static HBRUSH g_brush     = NULL;
+static COLORREF g_pen_color   = RGB(255,255,255);
+static COLORREF g_brush_color = RGB(0,0,0);
+static HANDLE g_gfx_thread = NULL;
+static CRITICAL_SECTION g_gfx_cs;
+/* Mouse state */
+static volatile int g_mouse_x     = 0;
+static volatile int g_mouse_y     = 0;
+static volatile int g_mouse_btn   = 0;   /* bit mask pulsanti correnti */
+static volatile int g_mouse_click = 0;   /* ultimo click (1/2/3), 0=consumato */
+static volatile int g_mouse_drag  = 0;   /* bit mask durante movimento */
+/* Text window mouse state */
+static volatile int g_tmouse_x     = 0;
+static volatile int g_tmouse_y     = 0;
+static volatile int g_tmouse_click = 0;
+static volatile int g_tmouse_drag  = 0;  /* bit mask: 1=left, 2=right, 4=middle */
+/* Timing state */
+static LARGE_INTEGER g_timer_freq    = {0};
+static LARGE_INTEGER g_timer_start   = {0};
+static LARGE_INTEGER g_timer_elapsed = {0};
 
 BOOL WINAPI ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT) {
@@ -132,6 +157,8 @@ void print_repl_screen_help(void);
 void add_repl_line(const char *line);
 Value call_math_function(const char *name, double *args, int nargs);
 Value call_screen_function(const char *name, Value *args, int nargs);
+static void gfx_open(int w, int h);
+static void gfx_refresh(void);
 
 /* ------------------------------------------------------------------ */
 /* PDCurses helpers                                                     */
@@ -153,6 +180,111 @@ static void init_color_pairs(void) {
             init_pair((short)(bg * 8 + fg + 1), (short)fg, (short)bg);
 }
 
+LRESULT CALLBACK GfxWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        EnterCriticalSection(&g_gfx_cs);
+        BitBlt(hdc, 0,0, g_gfx_w, g_gfx_h, g_hdc_buf, 0,0, SRCCOPY);
+        LeaveCriticalSection(&g_gfx_cs);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    if (msg == WM_DESTROY) { g_hwnd = NULL; return 0; }
+    if (msg == WM_SETCURSOR) {
+        SetCursor(LoadCursor(NULL, IDC_ARROW));
+        return TRUE;
+    }
+    if (msg == WM_MOUSEMOVE) {
+        g_mouse_x    = LOWORD(lp);
+        g_mouse_y    = HIWORD(lp);
+        g_mouse_drag = 0;
+        if (wp & MK_LBUTTON) g_mouse_drag |= 1;
+        if (wp & MK_RBUTTON) g_mouse_drag |= 2;
+        if (wp & MK_MBUTTON) g_mouse_drag |= 4;
+        return 0;
+    }
+    if (msg == WM_LBUTTONDOWN) {
+        g_mouse_x   = LOWORD(lp);
+        g_mouse_y   = HIWORD(lp);
+        g_mouse_btn |= 1;
+        g_mouse_click = 1;
+        return 0;
+    }
+    if (msg == WM_RBUTTONDOWN) {
+        g_mouse_x   = LOWORD(lp);
+        g_mouse_y   = HIWORD(lp);
+        g_mouse_btn |= 2;
+        g_mouse_click = 2;
+        return 0;
+    }
+    if (msg == WM_MBUTTONDOWN) {
+        g_mouse_x   = LOWORD(lp);
+        g_mouse_y   = HIWORD(lp);
+        g_mouse_btn |= 4;
+        g_mouse_click = 3;
+        return 0;
+    }
+    if (msg == WM_LBUTTONUP) { g_mouse_btn &= ~1; g_mouse_drag &= ~1; return 0; }
+    if (msg == WM_RBUTTONUP) { g_mouse_btn &= ~2; g_mouse_drag &= ~2; return 0; }
+    if (msg == WM_MBUTTONUP) { g_mouse_btn &= ~4; g_mouse_drag &= ~4; return 0; }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+DWORD WINAPI gfx_thread_func(LPVOID param) {
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc   = GfxWndProc;
+    wc.hInstance     = GetModuleHandle(NULL);
+    wc.lpszClassName = "ITLGfx";
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    RegisterClass(&wc);
+
+    g_hwnd = CreateWindow("ITLGfx", "ITL Graphics",
+        WS_OVERLAPPEDWINDOW, 100, 100,
+        g_gfx_w + 16, g_gfx_h + 39,
+        NULL, NULL, wc.hInstance, NULL);
+    ShowWindow(g_hwnd, SW_SHOW);
+    UpdateWindow(g_hwnd);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return 0;
+}
+
+static void gfx_open(int w, int h) {
+    if (g_hwnd) return;  /* già aperta */
+    g_gfx_w = w; g_gfx_h = h;
+    InitializeCriticalSection(&g_gfx_cs);
+
+    /* Crea backbuffer */
+    HDC hdc_screen = GetDC(NULL);
+    g_hdc_buf = CreateCompatibleDC(hdc_screen);
+    g_hbmp    = CreateCompatibleBitmap(hdc_screen, w, h);
+    SelectObject(g_hdc_buf, g_hbmp);
+    ReleaseDC(NULL, hdc_screen);
+
+    /* Riempie di nero */
+    RECT r = {0,0,w,h};
+    FillRect(g_hdc_buf, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+    /* Penna e pennello di default */
+    g_pen   = CreatePen(PS_SOLID, 1, g_pen_color);
+    g_brush = CreateSolidBrush(g_brush_color);
+    SelectObject(g_hdc_buf, g_pen);
+    SelectObject(g_hdc_buf, g_brush);
+
+    g_gfx_thread = CreateThread(NULL, 0, gfx_thread_func, NULL, 0, NULL);
+    Sleep(100);  /* attende che la finestra sia pronta */
+}
+
+static void gfx_refresh(void) {
+    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
 /* ------------------------------------------------------------------ */
 /* Initialize interpreter state                                         */
 /* ------------------------------------------------------------------ */
@@ -171,6 +303,10 @@ void init_interpreter(void) {
     source_lines = NULL;
     line_count = 0;
     current_line = 0;
+
+    QueryPerformanceFrequency(&g_timer_freq);
+    QueryPerformanceCounter(&g_timer_start);
+    g_timer_elapsed = g_timer_start;
 }
 
 /* ------------------------------------------------------------------ */
@@ -192,6 +328,15 @@ void cleanup_interpreter(void) {
 
     if (array_data)
         free(array_data);
+
+    if (g_hwnd) SendMessage(g_hwnd, WM_DESTROY, 0, 0);
+    if (g_gfx_thread) { WaitForSingleObject(g_gfx_thread, 1000); CloseHandle(g_gfx_thread); }
+    if (g_hdc_buf) DeleteDC(g_hdc_buf);
+    if (g_hbmp)    DeleteObject(g_hbmp);
+    if (g_pen)     DeleteObject(g_pen);
+    if (g_brush)   DeleteObject(g_brush);
+    if (g_hwnd)    DeleteCriticalSection(&g_gfx_cs);
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -657,6 +802,286 @@ Value call_screen_function(const char *name, Value *args, int nargs) {
         return result;
     }
 
+    /* tmx() ---------------------------------------------------------- */
+    if (strcmp(name, "tmx") == 0) {
+        result.data.num = (double)g_tmouse_x;
+        return result;
+    }
+
+    /* tmy() ---------------------------------------------------------- */
+    if (strcmp(name, "tmy") == 0) {
+        result.data.num = (double)g_tmouse_y;
+        return result;
+    }
+
+    /* tmclick() ------------------------------------------------------ */
+    /* Ritorna il pulsante dell'ultimo click (1/2/3) e lo azzera       */
+    if (strcmp(name, "tmclick") == 0) {
+        result.data.num = (double)g_tmouse_click;
+        g_tmouse_click = 0;
+        return result;
+    }
+
+    /* tmdrag(b) ------------------------------------------------------ */
+    /* Ritorna 1 se il pulsante b (1/2/3) è tenuto premuto             */
+    /* mentre il mouse si muove, 0 altrimenti                          */
+    if (strcmp(name, "tmdrag") == 0) {
+        int btn = (nargs >= 1) ? (int)value_to_number(args[0]) : 1;
+        int bit = (btn == 1) ? 1 : (btn == 2) ? 2 : 4;
+        result.data.num = (g_tmouse_drag & bit) ? 1.0 : 0.0;
+        return result;
+    }
+
+    /* gopen(w,h) ---------------------------------------------------- */
+    if (strcmp(name, "gopen") == 0) {
+        int w = (nargs >= 1) ? (int)value_to_number(args[0]) : 640;
+        int h = (nargs >= 2) ? (int)value_to_number(args[1]) : 480;
+        gfx_open(w, h);
+        result.data.num = 1.0;
+        return result;
+    }
+
+    /* gclear() ------------------------------------------------------- */
+    if (strcmp(name, "gclear") == 0) {
+        if (g_hdc_buf) {
+            EnterCriticalSection(&g_gfx_cs);
+            RECT r = {0, 0, g_gfx_w, g_gfx_h};
+            HBRUSH b = CreateSolidBrush(g_brush_color);
+            FillRect(g_hdc_buf, &r, b);
+            DeleteObject(b);
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* gpen(r,g,b) ---------------------------------------------------- */
+    if (strcmp(name, "gpen") == 0) {
+        if (nargs >= 3) {
+            int r = (int)value_to_number(args[0]);
+            int g = (int)value_to_number(args[1]);
+            int b = (int)value_to_number(args[2]);
+            g_pen_color = RGB(r, g, b);
+            EnterCriticalSection(&g_gfx_cs);
+            HPEN new_pen = CreatePen(PS_SOLID, 1, g_pen_color);
+            SelectObject(g_hdc_buf, new_pen);
+            if (g_pen) DeleteObject(g_pen);
+            g_pen = new_pen;
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* gbr(r,g,b) ----------------------------------------------------- */
+    if (strcmp(name, "gbr") == 0) {
+        if (nargs >= 3) {
+            int r = (int)value_to_number(args[0]);
+            int g = (int)value_to_number(args[1]);
+            int b = (int)value_to_number(args[2]);
+            g_brush_color = RGB(r, g, b);
+            EnterCriticalSection(&g_gfx_cs);
+            HBRUSH new_brush = CreateSolidBrush(g_brush_color);
+            SelectObject(g_hdc_buf, new_brush);
+            if (g_brush) DeleteObject(g_brush);
+            g_brush = new_brush;
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* gpixel(x,y) ---------------------------------------------------- */
+    if (strcmp(name, "gpixel") == 0) {
+        if (nargs >= 2 && g_hdc_buf) {
+            int x = (int)value_to_number(args[0]);
+            int y = (int)value_to_number(args[1]);
+            EnterCriticalSection(&g_gfx_cs);
+            SetPixel(g_hdc_buf, x, y, g_pen_color);
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* gline(x1,y1,x2,y2) -------------------------------------------- */
+    if (strcmp(name, "gline") == 0) {
+        if (nargs >= 4 && g_hdc_buf) {
+            int x1 = (int)value_to_number(args[0]);
+            int y1 = (int)value_to_number(args[1]);
+            int x2 = (int)value_to_number(args[2]);
+            int y2 = (int)value_to_number(args[3]);
+            EnterCriticalSection(&g_gfx_cs);
+            MoveToEx(g_hdc_buf, x1, y1, NULL);
+            LineTo(g_hdc_buf, x2, y2);
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* grect(x1,y1,x2,y2) -------------------------------------------- */
+    /* Disegna solo il bordo (usa penna corrente, pennello trasparente)  */
+    if (strcmp(name, "grect") == 0) {
+        if (nargs >= 4 && g_hdc_buf) {
+            int x1 = (int)value_to_number(args[0]);
+            int y1 = (int)value_to_number(args[1]);
+            int x2 = (int)value_to_number(args[2]);
+            int y2 = (int)value_to_number(args[3]);
+            EnterCriticalSection(&g_gfx_cs);
+            HBRUSH old_brush = (HBRUSH)SelectObject(g_hdc_buf,
+                                   GetStockObject(NULL_BRUSH));
+            Rectangle(g_hdc_buf, x1, y1, x2, y2);
+            SelectObject(g_hdc_buf, old_brush);
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* gfillrect(x1,y1,x2,y2) ---------------------------------------- */
+    /* Rettangolo pieno con pennello corrente                            */
+    if (strcmp(name, "gfillrect") == 0) {
+        if (nargs >= 4 && g_hdc_buf) {
+            int x1 = (int)value_to_number(args[0]);
+            int y1 = (int)value_to_number(args[1]);
+            int x2 = (int)value_to_number(args[2]);
+            int y2 = (int)value_to_number(args[3]);
+            EnterCriticalSection(&g_gfx_cs);
+            Rectangle(g_hdc_buf, x1, y1, x2, y2);
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* gcircle(x,y,r) ------------------------------------------------- */
+    /* Ellisse (solo bordo) centrata in (x,y) con raggio r              */
+    if (strcmp(name, "gcircle") == 0) {
+        if (nargs >= 3 && g_hdc_buf) {
+            int x = (int)value_to_number(args[0]);
+            int y = (int)value_to_number(args[1]);
+            int r = (int)value_to_number(args[2]);
+            EnterCriticalSection(&g_gfx_cs);
+            HBRUSH old_brush = (HBRUSH)SelectObject(g_hdc_buf,
+                                   GetStockObject(NULL_BRUSH));
+            Ellipse(g_hdc_buf, x - r, y - r, x + r, y + r);
+            SelectObject(g_hdc_buf, old_brush);
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* gfillcircle(x,y,r) -------------------------------------------- */
+    /* Ellisse piena con pennello corrente                               */
+    if (strcmp(name, "gfillcircle") == 0) {
+        if (nargs >= 3 && g_hdc_buf) {
+            int x = (int)value_to_number(args[0]);
+            int y = (int)value_to_number(args[1]);
+            int r = (int)value_to_number(args[2]);
+            EnterCriticalSection(&g_gfx_cs);
+            Ellipse(g_hdc_buf, x - r, y - r, x + r, y + r);
+            LeaveCriticalSection(&g_gfx_cs);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* gtext(x,y,str) ------------------------------------------------- */
+    /* Scrive testo in posizione pixel (x,y) con colore penna corrente  */
+    if (strcmp(name, "gtext") == 0) {
+        if (nargs >= 3 && g_hdc_buf) {
+            int x = (int)value_to_number(args[0]);
+            int y = (int)value_to_number(args[1]);
+            char *str = (args[2].type == TYPE_STRING)
+                        ? args[2].data.str
+                        : value_to_string(args[2]);
+            EnterCriticalSection(&g_gfx_cs);
+            SetTextColor(g_hdc_buf, g_pen_color);
+            SetBkMode(g_hdc_buf, TRANSPARENT);
+            TextOut(g_hdc_buf, x, y, str, (int)strlen(str));
+            LeaveCriticalSection(&g_gfx_cs);
+            if (args[2].type != TYPE_STRING) free(str);
+            result.data.num = 1.0;
+        }
+        return result;
+    }
+
+    /* grefresh() ----------------------------------------------------- */
+    if (strcmp(name, "grefresh") == 0) {
+        gfx_refresh();
+        result.data.num = 1.0;
+        return result;
+    }
+
+    /* gmx() ---------------------------------------------------------- */
+    if (strcmp(name, "gmx") == 0) {
+        result.data.num = (double)g_mouse_x;
+        return result;
+    }
+
+    /* gmy() ---------------------------------------------------------- */
+    if (strcmp(name, "gmy") == 0) {
+        result.data.num = (double)g_mouse_y;
+        return result;
+    }
+
+    /* gmb() ---------------------------------------------------------- */
+    /* Ritorna la maschera dei pulsanti attualmente premuti            */
+    /* bit 0=sinistro, bit 1=destro, bit 2=centrale                   */
+    if (strcmp(name, "gmb") == 0) {
+        result.data.num = (double)g_mouse_btn;
+        return result;
+    }
+
+    /* gmclick() ------------------------------------------------------ */
+    /* Ritorna il pulsante dell'ultimo click (1/2/3) e lo azzera       */
+    if (strcmp(name, "gmclick") == 0) {
+        result.data.num = (double)g_mouse_click;
+        g_mouse_click = 0;
+        return result;
+    }
+
+    /* gmdrag(b) ------------------------------------------------------ */
+    /* Ritorna 1 se il pulsante b (1/2/3) è tenuto premuto             */
+    /* mentre il mouse si muove, 0 altrimenti                          */
+    if (strcmp(name, "gmdrag") == 0) {
+        int btn = (nargs >= 1) ? (int)value_to_number(args[0]) : 1;
+        int bit = (btn == 1) ? 1 : (btn == 2) ? 2 : 4;
+        result.data.num = (g_mouse_drag & bit) ? 1.0 : 0.0;
+        return result;
+    }
+
+    /* time() -------------------------------------------------------- */
+    /* Restituisce i secondi interi trascorsi dall'epoca Unix (1/1/1970) */
+    if (strcmp(name, "time") == 0) {
+        result.data.num = (double)time(NULL);
+        return result;
+    }
+
+    /* ticks() ------------------------------------------------------- */
+    /* Restituisce i millisecondi trascorsi dall'avvio dell'interprete   */
+    if (strcmp(name, "ticks") == 0) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        result.data.num = (double)(now.QuadPart - g_timer_start.QuadPart)
+                          * 1000.0 / (double)g_timer_freq.QuadPart;
+        return result;
+    }
+
+    /* elapsed() ----------------------------------------------------- */
+    /* Restituisce i millisecondi trascorsi dall'ultima chiamata         */
+    /* a elapsed() (o dall'avvio se non era mai stata chiamata)         */
+    if (strcmp(name, "elapsed") == 0) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        result.data.num = (double)(now.QuadPart - g_timer_elapsed.QuadPart)
+                          * 1000.0 / (double)g_timer_freq.QuadPart;
+        g_timer_elapsed = now;
+        return result;
+    }
+
     /* Unknown screen function */
     result.type = TYPE_UNDEFINED;
     return result;
@@ -668,7 +1093,13 @@ Value call_screen_function(const char *name, Value *args, int nargs) {
 static int is_screen_function(const char *name) {
     static const char *screen_funcs[] = {
         "gotoxy", "putch", "getch", "setfore", "setback",
-        "setattr", "getw", "geth", "clear", NULL
+        "setattr", "getw", "geth", "clear",
+        "tmx", "tmy", "tmclick", "tmdrag",
+        "gopen","gclear","gpen","gbr","gpixel","gline",
+        "grect","gfillrect","gcircle","gfillcircle","gtext","grefresh",
+        "gmx", "gmy", "gmb", "gmclick", "gmdrag",
+        "time", "ticks", "elapsed",
+        NULL
     };
     for (int i = 0; screen_funcs[i]; i++)
         if (strcmp(name, screen_funcs[i]) == 0) return 1;
@@ -946,7 +1377,21 @@ Value parse_primary(ParseContext *ctx) {
         nodelay(stdscr, TRUE);
         int key = wgetch(stdscr);
         nodelay(stdscr, FALSE);
-        result.data.num = (key == ERR) ? 0.0 : (double)key;
+        if (key == KEY_MOUSE) {
+            mmask_t bstate = getmouse();
+            request_mouse_pos();
+            g_tmouse_x = Mouse_status.x;
+            g_tmouse_y = Mouse_status.y;
+            if (bstate & BUTTON1_PRESSED) { g_tmouse_click = 1; g_tmouse_drag |= 1; }
+            if (bstate & BUTTON2_PRESSED) { g_tmouse_click = 2; g_tmouse_drag |= 2; }
+            if (bstate & BUTTON3_PRESSED) { g_tmouse_click = 3; g_tmouse_drag |= 4; }
+            if (bstate & BUTTON1_RELEASED) g_tmouse_drag &= ~1;
+            if (bstate & BUTTON2_RELEASED) g_tmouse_drag &= ~2;
+            if (bstate & BUTTON3_RELEASED) g_tmouse_drag &= ~4;
+            result.data.num = 0.0;
+        } else {
+            result.data.num = (key == ERR) ? 0.0 : (double)key;
+        }
         return result;
     }
 
@@ -1775,8 +2220,8 @@ void run_repl(void) {
     repl_mode = 1;
     show_assignments = 1;
 
-    printw("ITL (Incredibly Tiny Language) Advanced REPL v4.0\n");
-    printw("Type ':help' for the list of commands or start programming!\n");
+    printw("ITL (Incredibly Tiny Language) Advanced REPL v0.5.0\n");
+    printw("Type ':help' for the list of commands.\n");
     printw("Type ':exit' to quit.\n\n");
     refresh();
 
@@ -1842,11 +2287,14 @@ int main(int argc, char *argv[]) {
     idlok(stdscr, TRUE);
 
     /* Do not translate function/arrow keys; keep raw key codes        */
-    keypad(stdscr, FALSE);
+    //keypad(stdscr, FALSE);
+    /* Changed to get mouse events */
+    keypad(stdscr, TRUE);
 
     /* Do not automatically echo typed characters (we control this     */
     /* explicitly when reading user input)                             */
     noecho();
+    mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
 
     /* Set default appearance: white text on black background          */
     /* Pair 8 = bg=0 (black), fg=7 (white)  per our pair formula      */
